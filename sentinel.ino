@@ -10,10 +10,8 @@
 #include "soc/rtc_cntl_reg.h"
 #include "secrets.h"
 
-// ================= CONFIGURAZIONE CALLMEBOT =================
 const String telegram_username = TELEGRAM_USERNAME;
 
-// ================= PIN =================
 #define PIN_SERVO      17
 #define PIN_TRIG       15
 #define PIN_ECHO       23
@@ -22,52 +20,37 @@ const String telegram_username = TELEGRAM_USERNAME;
 #define PIN_LED_Y      27
 #define PIN_LED_R      13
 
-// ================= PARAMETRI =================
 const int MAX_WORLD_DIST = 160;
 const int LOCK_DIST      = 80;
 const int DANGER_DIST    = 40;
 const int TRACK_WIDTH    = 25;
 
-// ================= OGGETTI =================
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 NewPing sonar(PIN_TRIG, PIN_ECHO, MAX_WORLD_DIST);
 ServoEasing myServo;
-WiFiClient client;
 
-// ================= VARIABILI CONDIVISE =================
 volatile int  sharedDist          = 999;
 volatile int  sharedAngle         = 90;
 volatile bool systemReady         = false;
 volatile bool isTrackingMode      = false; 
 volatile bool isDangerActive      = false; 
+volatile int  bootPhase           = 0;
+volatile int  lastKnownDangerDist = 0;
 
-// Variabili di stato boot
-volatile int bootPhase = 0;
-
-// Mappa radar
 int radarMap[181];
-
-// ================= VARIABILI FILTRO E CONTATORE =================
 int laserHistory[3] = {999, 999, 999};
 byte laserIdx = 0;
-int detectionCount = 0; // Regola del Tre
+int detectionCount = 0;
 
-// ================= VARIABILI TRACKING =================
 int           currentScanTarget     = 165;
 unsigned long lastDetectionTime     = 0;
 int           trackingCenter        = 90;
-
-// Sweep attivo
 int           trackBestAngle        = 90;
 int           trackBestDist         = 999;
 bool          trackSweepLeft        = true;
-
-// Danger con isteresi
 unsigned long lastDangerTime        = 0;
-volatile int  lastKnownDangerDist   = 0; // Volatile perché letta dal Core 0
 
-// ================= FUNZIONE INVIO HTTP =================
 void sendLightMessage(String text) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient client;
@@ -86,7 +69,6 @@ void sendLightMessage(String text) {
   }
 }
 
-// ================= TASK CONNESSIONE (CORE 0) =================
 void TaskTelegram(void * pvParameters) {
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
   int tentativi = 0;
@@ -111,18 +93,10 @@ void TaskTelegram(void * pvParameters) {
     if (systemReady) {
       unsigned long now = millis();
       if (isDangerActive) {
-        // Anti-spam telegram: invia ogni 8 secondi se persiste
-        if (!inDangerZoneLocal || (now - lastDangerTimeLocal > 8000)) {
-          
-          // === MODIFICA RICHIESTA: MESSAGGIO CON DISTANZA ===
+        if (!inDangerZoneLocal || (now - lastDangerTimeLocal > 5000)) {
           String msg;
-          if (inDangerZoneLocal) {
-             msg = "Ancora rilevato: " + String(lastKnownDangerDist) + "cm";
-          } else {
-             msg = "INTRUSO! Angolo: " + String(sharedAngle) + "deg - Dist: " + String(lastKnownDangerDist) + "cm";
-          }
-          // ==================================================
-
+          if (inDangerZoneLocal) msg = "Ancora rilevato: " + String(lastKnownDangerDist) + "cm";
+          else msg = "INTRUSO! Angolo: " + String(sharedAngle) + "deg - Dist: " + String(lastKnownDangerDist) + "cm";
           sendLightMessage(msg);
           inDangerZoneLocal = true; lastDangerTimeLocal = now;
         }
@@ -136,7 +110,6 @@ void TaskTelegram(void * pvParameters) {
   }
 }
 
-// ================= SETUP (CORE 1) =================
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
@@ -160,7 +133,6 @@ void setup() {
   xTaskCreatePinnedToCore(TaskTelegram, "TelegramTask", 10000, NULL, 1, NULL, 0);
 }
 
-// ================= LOOP (CORE 1) =================
 void loop() {
   esp_task_wdt_reset();
 
@@ -175,26 +147,18 @@ void loop() {
   int currentServoAngle = myServo.getCurrentAngle();
   unsigned long now = millis();
 
-  // --- LETTURA SENSORI ---
   int rawLaser = 999;
   VL53L0X_RangingMeasurementData_t m;
   lox.rangingTest(&m, false);
-  
   if (m.RangeStatus != 4) rawLaser = m.RangeMilliMeter / 10;
-  else rawLaser = 999;
-
-  // Filtro 1 (Tagliola < 5cm per bug VL53L0X)
+  
   if (rawLaser < 5) rawLaser = 999;
 
-  // Filtro 2 (Mediana 3 campioni)
   laserHistory[laserIdx] = rawLaser;
   laserIdx = (laserIdx + 1) % 3;
 
-  int a = laserHistory[0]; int b = laserHistory[1]; int c = laserHistory[2];
-  int laserVal;
-  if ((a <= b) && (a <= c)) laserVal = (b <= c) ? b : c;
-  else if ((b <= a) && (b <= c)) laserVal = (a <= c) ? a : c;
-  else laserVal = (a <= b) ? a : b;
+  int a = laserHistory[0], b = laserHistory[1], c = laserHistory[2];
+  int laserVal = (a <= b) ? ((b <= c) ? b : ((a < c) ? c : a)) : ((a <= c) ? a : ((b < c) ? c : b));
 
   unsigned int uS = sonar.ping_median(3);
   int sonarVal = sonar.convert_cm(uS);
@@ -206,15 +170,13 @@ void loop() {
   sharedDist = finalDist;
   sharedAngle = currentServoAngle;
 
-  // --- TIMEOUT TRACKING ---
   if (isTrackingMode && (now - lastDetectionTime > 2000)) {
     isTrackingMode = false;
     trackBestDist = 999; trackBestAngle = trackingCenter;
     myServo.setSpeed(30);
-    detectionCount = 0; // Reset contatore all'uscita
+    detectionCount = 0; 
   }
 
-  // --- LOGICA ANTI-FANTASMA (Regola del 3) ---
   if (finalDist > 0 && finalDist < LOCK_DIST) {
     detectionCount++;
     if (detectionCount >= 3) {
@@ -232,17 +194,15 @@ void loop() {
     detectionCount = 0; 
   }
 
-  // Logica Danger 
   if (finalDist > 0 && finalDist < DANGER_DIST && detectionCount >= 3) {
     isDangerActive = true;
     lastDangerTime = now;
-    lastKnownDangerDist = finalDist; // Aggiorna la variabile letta da Telegram
+    lastKnownDangerDist = finalDist;
   }
   if (isDangerActive && (now - lastDangerTime > 2000)) {
     isDangerActive = false;
   }
 
-  // --- MOVIMENTO SERVO ---
   if (isTrackingMode) {
     int minCone = max(15, trackingCenter - TRACK_WIDTH);
     int maxCone = min(165, trackingCenter + TRACK_WIDTH);
@@ -267,7 +227,6 @@ void loop() {
     }
   }
 
-  // --- UI ---
   if (finalDist > 0 && finalDist < MAX_WORLD_DIST) radarMap[currentServoAngle] = finalDist;
   else radarMap[currentServoAngle] = 0;
 
@@ -293,7 +252,7 @@ void drawScanning(int angle) {
     if (radarMap[i] > 0) {
       float rad = (180 - i) * PI / 180.0;
       int distPx = map(radarMap[i], 0, MAX_WORLD_DIST, 0, 60);
-      int px = 64 + distPx * cos(rad); int py = 64 - distPx * sin(rad);
+      int px = 64 + distPx * cos(rad), py = 64 - distPx * sin(rad);
       if (radarMap[i] < LOCK_DIST) display.drawCircle(px, py, 1, SH110X_WHITE);
       else display.drawPixel(px, py, SH110X_WHITE);
     }
