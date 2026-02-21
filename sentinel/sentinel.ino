@@ -20,7 +20,7 @@ const String telegram_username = TELEGRAM_USERNAME;
 #define PIN_LED_Y      27
 #define PIN_LED_R      13
 
-const int MAX_WORLD_DIST = 160;
+const int MAX_WORLD_DIST = 250;
 const int LOCK_DIST      = 80;
 const int DANGER_DIST    = 40;
 const int TRACK_WIDTH    = 25;
@@ -30,6 +30,9 @@ Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 NewPing sonar(PIN_TRIG, PIN_ECHO, MAX_WORLD_DIST);
 ServoEasing myServo;
 
+//Variabili usate sia da core 0 che 1. Il primo in lettura, secondo scrittura. 
+//ESP lavora a 32bit. Lettura e scrittura atomiche. Anche se condivise senza mutua
+//esclusione non rischio lettura errate fatte a metà scrittura
 volatile int  sharedDist          = 999;
 volatile int  sharedAngle         = 90;
 volatile bool systemReady         = false;
@@ -38,8 +41,9 @@ volatile bool isDangerActive      = false;
 volatile int  bootPhase           = 0;
 volatile int  lastKnownDangerDist = 0;
 
-int radarMap[181];
-int laserHistory[3] = {999, 999, 999};
+int radarMap[181]; //Mantenere in memoria posizione
+
+int laserHistory[3] = {999, 999, 999}; //3 letture per prendere mediana 
 byte laserIdx = 0;
 int detectionCount = 0;
 
@@ -56,8 +60,6 @@ void sendLightMessage(String text) {
     WiFiClient client;
     if (client.connect("api.callmebot.com", 80)) {
       text.replace(" ", "%20");
-      text.replace("⚠️", "[ALLARME]");
-      text.replace("🚨", "[INTRUSO]");
       String url = "/text.php?user=" + telegram_username + "&text=" + text;
       client.print(String("GET ") + url + " HTTP/1.1\r\nHost: api.callmebot.com\r\nConnection: close\r\n\r\n");
       unsigned long timeout = millis();
@@ -70,10 +72,11 @@ void sendLightMessage(String text) {
 }
 
 void TaskTelegram(void * pvParameters) {
+
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
   int tentativi = 0;
   while (WiFi.status() != WL_CONNECTED && tentativi < 20) {
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    vTaskDelay(500);
     tentativi++;
   }
 
@@ -82,26 +85,27 @@ void TaskTelegram(void * pvParameters) {
     sendLightMessage("SENTINEL ONLINE");
   } else { bootPhase = 2; }
 
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
+  vTaskDelay(2000);
   bootPhase = 3;
 
   bool inDangerZoneLocal = false;
   unsigned long lastDangerTimeLocal = 0;
 
   for (;;) {
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    vTaskDelay(100);
     if (systemReady) {
       unsigned long now = millis();
       if (isDangerActive) {
+        //ANTISPAM
         if (!inDangerZoneLocal || (now - lastDangerTimeLocal > 5000)) {
           String msg;
           if (inDangerZoneLocal) msg = "Ancora rilevato: " + String(lastKnownDangerDist) + "cm";
-          else msg = "INTRUSO! Angolo: " + String(sharedAngle) + "deg - Dist: " + String(lastKnownDangerDist) + "cm";
+          else msg = "INTRUSO! Rilevato a " + String(lastKnownDangerDist) + "cm";
           sendLightMessage(msg);
           inDangerZoneLocal = true; lastDangerTimeLocal = now;
         }
       } else if (inDangerZoneLocal) {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(3000);
         if (!isDangerActive) {
           sendLightMessage("Zona Libera"); inDangerZoneLocal = false;
         }
@@ -110,10 +114,15 @@ void TaskTelegram(void * pvParameters) {
   }
 }
 
-void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  Serial.begin(115200);
+int getMedian(int a, int b, int c) {
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
 
+void setup() {
+  Serial.begin(115200);
+   
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = { .timeout_ms = 30000, .idle_core_mask = (1 << 1), .trigger_panic = true };
   esp_task_wdt_init(&wdt_config);
@@ -123,9 +132,9 @@ void setup() {
   pinMode(PIN_BUZZ, OUTPUT);
 
   Wire.begin(21, 22); display.begin(0x3C, true);
-  if (lox.begin()) lox.setMeasurementTimingBudgetMicroSeconds(30000);
+  lox.begin();
 
-  if (myServo.attach(PIN_SERVO, 500, 2400) != -1) {
+  if (myServo.attach(PIN_SERVO) != -1) {
     myServo.setEasingType(EASE_LINEAR);
     myServo.setSpeed(30); myServo.startEaseTo(15);
   }
@@ -139,10 +148,20 @@ void loop() {
   if (bootPhase < 3) {
     display.clearDisplay();
     display.setTextSize(1); display.setTextColor(SH110X_WHITE);
-    display.setCursor(10, 20); display.print("SYSTEM BOOT...");
+    display.setCursor(10, 20); 
+    
+    if (bootPhase == 0) {
+      display.print("WIFI CONNECTING...");
+    } else if (bootPhase == 1) {
+      display.print("WIFI OK! ONLINE");
+    } else if (bootPhase == 2) {
+      display.print("WIFI FAIL. OFFLINE");
+    }
+    
     display.display();
     return;
   }
+
 
   int currentServoAngle = myServo.getCurrentAngle();
   unsigned long now = millis();
@@ -158,10 +177,13 @@ void loop() {
   laserIdx = (laserIdx + 1) % 3;
 
   int a = laserHistory[0], b = laserHistory[1], c = laserHistory[2];
-  int laserVal = (a <= b) ? ((b <= c) ? b : ((a < c) ? c : a)) : ((a <= c) ? a : ((b < c) ? c : b));
+  int laserVal = getMedian(a, b, c);
 
   unsigned int uS = sonar.ping_median(3);
   int sonarVal = sonar.convert_cm(uS);
+  if (sonarVal > 0 && sonarVal < 5) {
+    sonarVal = 999; 
+  }
 
   int finalDist = 999;
   if (laserVal > 0 && laserVal < LOCK_DIST) finalDist = laserVal;
@@ -170,16 +192,21 @@ void loop() {
   sharedDist = finalDist;
   sharedAngle = currentServoAngle;
 
-  if (isTrackingMode && (now - lastDetectionTime > 2000)) {
+  //Sgancio da tracking
+  if (isTrackingMode && (now - lastDetectionTime > 3000)) {
     isTrackingMode = false;
     trackBestDist = 999; trackBestAngle = trackingCenter;
     myServo.setSpeed(30);
     detectionCount = 0; 
   }
 
+  //Aggancio tracking
   if (finalDist > 0 && finalDist < LOCK_DIST) {
     detectionCount++;
-    if (detectionCount >= 3) {
+    if (isTrackingMode) {
+      lastDetectionTime = now;
+    }
+    if (detectionCount >= 6) {
       lastDetectionTime = now;
       if (!isTrackingMode) {
         isTrackingMode = true;
@@ -194,19 +221,24 @@ void loop() {
     detectionCount = 0; 
   }
 
+  //Passaggio a Danger
   if (finalDist > 0 && finalDist < DANGER_DIST && detectionCount >= 3) {
     isDangerActive = true;
     lastDangerTime = now;
     lastKnownDangerDist = finalDist;
   }
-  if (isDangerActive && (now - lastDangerTime > 2000)) {
+  //No Danger
+  if (isDangerActive && (now - lastDangerTime > 1000)) {
     isDangerActive = false;
   }
 
+  //Tracking vero e proprio
   if (isTrackingMode) {
     int minCone = max(15, trackingCenter - TRACK_WIDTH);
     int maxCone = min(165, trackingCenter + TRACK_WIDTH);
 
+    //Mentre si muove aggiorna migliore distanza e angolo. Se è fermo (arrivato a min/max) aggiorna lo stato
+    //per ripartire a trackare e seguire il bersaglio
     if (myServo.isMoving()) {
       if (finalDist > 0 && finalDist < LOCK_DIST && finalDist < trackBestDist) {
         trackBestDist = finalDist; trackBestAngle = currentServoAngle;
@@ -227,22 +259,33 @@ void loop() {
     }
   }
 
-  if (finalDist > 0 && finalDist < MAX_WORLD_DIST) radarMap[currentServoAngle] = finalDist;
+  if (finalDist > 0 && finalDist < MAX_WORLD_DIST) radarMap[currentServoAngle] = finalDist; 
   else radarMap[currentServoAngle] = 0;
 
   digitalWrite(PIN_LED_V, LOW); digitalWrite(PIN_LED_Y, LOW); digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_BUZZ, LOW);
 
   if (isDangerActive) {
-    digitalWrite(PIN_LED_R, HIGH); if ((millis() / 100) % 2 == 0) digitalWrite(PIN_BUZZ, HIGH);
-    drawDanger(lastKnownDangerDist);
+    digitalWrite(PIN_LED_R, HIGH);
+    digitalWrite(PIN_BUZZ, HIGH); 
   } else if (isTrackingMode) {
-    digitalWrite(PIN_LED_Y, HIGH);
-    drawTracking(finalDist < LOCK_DIST ? finalDist : lastKnownDangerDist);
+    digitalWrite(PIN_LED_Y, HIGH); 
   } else {
-    digitalWrite(PIN_LED_V, HIGH);
-    drawScanning(currentServoAngle);
+    digitalWrite(PIN_LED_V, HIGH); 
+  }
+
+  static unsigned long lastDisplayUpdate = 0;
+  if (now - lastDisplayUpdate > 50) {
+    if (isDangerActive) {
+      drawDanger(lastKnownDangerDist);
+    } else if (isTrackingMode) {
+      drawTracking(finalDist < LOCK_DIST ? finalDist : lastKnownDangerDist);
+    } else {
+      drawScanning(currentServoAngle);
+    }
+    lastDisplayUpdate = now;
   }
   delay(10);
+
 }
 
 void drawScanning(int angle) {
@@ -250,20 +293,23 @@ void drawScanning(int angle) {
   display.drawCircle(64, 64, 60, SH110X_WHITE); display.drawCircle(64, 64, 30, SH110X_WHITE);
   for (int i = 0; i < 181; i++) {
     if (radarMap[i] > 0) {
-      float rad = (180 - i) * PI / 180.0;
+      float rad = i * PI / 180.0;
       int distPx = map(radarMap[i], 0, MAX_WORLD_DIST, 0, 60);
-      int px = 64 + distPx * cos(rad), py = 64 - distPx * sin(rad);
-      if (radarMap[i] < LOCK_DIST) display.drawCircle(px, py, 1, SH110X_WHITE);
-      else display.drawPixel(px, py, SH110X_WHITE);
+      int px = 64 + distPx * cos(rad);
+      int py = 64 - distPx * sin(rad);
+      if (radarMap[i] < LOCK_DIST)
+        display.drawCircle(px, py, 1, SH110X_WHITE);
+      else
+      display.drawPixel(px, py, SH110X_WHITE);
     }
-  }
+}
   float lineRad = (180 - angle) * PI / 180.0;
   display.drawLine(64, 64, 64 + 60 * cos(lineRad), 64 - 60 * sin(lineRad), SH110X_WHITE);
   display.display();
 }
 
 void drawTracking(int d) {
-  display.clearDisplay(); display.drawRect(0, 0, 128, 64, SH110X_WHITE);
+  display.clearDisplay(); display.drawRect(0, 0, 128, 64, SH110X_WHITE); //Cornice
   display.drawLine(64, 10, 64, 54, SH110X_WHITE); display.drawLine(30, 32, 98, 32, SH110X_WHITE);
   display.fillCircle(64, 32, 4, SH110X_WHITE);
   display.setTextSize(1); display.setTextColor(SH110X_WHITE);
