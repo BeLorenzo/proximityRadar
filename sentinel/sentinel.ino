@@ -10,8 +10,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "secrets.h"
 
-const String telegram_username = TELEGRAM_USERNAME;
-
+// --- CONFIGURAZIONE PIN ---
 #define PIN_SERVO      17
 #define PIN_TRIG       15
 #define PIN_ECHO       23
@@ -20,40 +19,74 @@ const String telegram_username = TELEGRAM_USERNAME;
 #define PIN_LED_Y      27
 #define PIN_LED_R      13
 
-const int MAX_WORLD_DIST = 250;
-const int LOCK_DIST      = 80;
-const int DANGER_DIST    = 40;
-const int TRACK_WIDTH    = 25;
+// --- COSTANTI LOGICA E SOGLIE ---
+const String telegram_username      = TELEGRAM_USERNAME;
+const int INVALID_DIST              = 999;
+const int MIN_VALID_DIST            = 5;
+const int MAX_WORLD_DIST            = 250;
+const int LOCK_DIST                 = 80;
+const int DANGER_DIST               = 40;
+const int TRACK_WIDTH               = 25;
+const int SERVO_MIN_ANGLE           = 15;
+const int SERVO_MAX_ANGLE           = 165;
+const int SERVO_CENTER_ANGLE        = 90;
+const int SERVO_SPEED_SCAN          = 30;
+const int SERVO_SPEED_TRACK         = 65;
+const int RADAR_MAP_SIZE            = 181;
+const int LASER_HISTORY_SIZE        = 3;
+const unsigned long TRACKING_TIMEOUT_MS = 3000;
+const unsigned long DANGER_TIMEOUT_MS   = 1000;
+const unsigned long DISPLAY_UPDATE_MS   = 50;
+const int TRACK_MIN_DETECTIONS      = 6;
+const int TRACK_MAX_DETECTIONS      = 10;
+const int DANGER_MIN_DETECTIONS     = 3;
 
-Adafruit_SH1106G display(128, 64, &Wire, -1);
+// --- COSTANTI DISPLAY ---
+const int OLED_WIDTH                = 128;
+const int OLED_HEIGHT               = 64;
+const int SCAN_CENTER_X             = 64;
+const int SCAN_CENTER_Y             = 64;
+const int SCAN_RADIUS_OUTER         = 60;
+const int SCAN_RADIUS_INNER         = 30;
+const int TRACK_CROSSHAIR_X         = 64;
+const int TRACK_CROSSHAIR_Y         = 32;
+const int TRACK_CROSSHAIR_R         = 4;
+
+// --- OGGETTI HARDWARE ---
+Adafruit_SH1106G display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 NewPing sonar(PIN_TRIG, PIN_ECHO, MAX_WORLD_DIST);
 ServoEasing myServo;
 
-//Variabili usate sia da core 0 che 1. Il primo in lettura, secondo scrittura. 
-//ESP lavora a 32bit. Lettura e scrittura atomiche. Anche se condivise senza mutua
-//esclusione non rischio lettura errate fatte a metà scrittura
-volatile int  sharedDist          = 999;
-volatile int  sharedAngle         = 90;
-volatile bool systemReady         = false;
-volatile bool isTrackingMode      = false; 
-volatile bool isDangerActive      = false; 
-volatile int  bootPhase           = 0;
-volatile int  lastKnownDangerDist = 0;
+// --- VARIABILI GLOBALI E CONDIVISE ---
+volatile int  sharedDist            = INVALID_DIST;
+volatile int  sharedAngle           = SERVO_CENTER_ANGLE;
+volatile bool systemReady           = false;
+volatile bool isTrackingMode        = false; 
+volatile bool isDangerActive        = false; 
+volatile int  bootPhase             = 0;
+volatile int  lastKnownDangerDist   = 0;
 
-int radarMap[181]; //Mantenere in memoria posizione
-
-int laserHistory[3] = {999, 999, 999}; //3 letture per prendere mediana 
+int radarMap[RADAR_MAP_SIZE]; 
+int laserHistory[LASER_HISTORY_SIZE] = {INVALID_DIST, INVALID_DIST, INVALID_DIST}; 
 byte laserIdx = 0;
 int detectionCount = 0;
 
-int           currentScanTarget     = 165;
+int           currentScanTarget     = SERVO_MAX_ANGLE;
 unsigned long lastDetectionTime     = 0;
-int           trackingCenter        = 90;
-int           trackBestAngle        = 90;
-int           trackBestDist         = 999;
+int           trackingCenter        = SERVO_CENTER_ANGLE;
+int           trackBestAngle        = SERVO_CENTER_ANGLE;
+int           trackBestDist         = INVALID_DIST;
 bool          trackSweepLeft        = true;
 unsigned long lastDangerTime        = 0;
+unsigned long lastDisplayUpdate     = 0;
+
+// --- FUNZIONI DI SUPPORTO ---
+int getMedian(int a, int b, int c) {
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
 
 void sendLightMessage(String text) {
   if (WiFi.status() == WL_CONNECTED) {
@@ -71,8 +104,8 @@ void sendLightMessage(String text) {
   }
 }
 
+// --- TASK TELEGRAM (Core 0) ---
 void TaskTelegram(void * pvParameters) {
-
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
   int tentativi = 0;
   while (WiFi.status() != WL_CONNECTED && tentativi < 20) {
@@ -96,11 +129,8 @@ void TaskTelegram(void * pvParameters) {
     if (systemReady) {
       unsigned long now = millis();
       if (isDangerActive) {
-        //ANTISPAM
         if (!inDangerZoneLocal || (now - lastDangerTimeLocal > 5000)) {
-          String msg;
-          if (inDangerZoneLocal) msg = "Ancora rilevato: " + String(lastKnownDangerDist) + "cm";
-          else msg = "INTRUSO! Rilevato a " + String(lastKnownDangerDist) + "cm";
+          String msg = inDangerZoneLocal ? "Ancora rilevato: " + String(lastKnownDangerDist) + "cm" : "INTRUSO! Rilevato a " + String(lastKnownDangerDist) + "cm";
           sendLightMessage(msg);
           inDangerZoneLocal = true; lastDangerTimeLocal = now;
         }
@@ -114,12 +144,109 @@ void TaskTelegram(void * pvParameters) {
   }
 }
 
-int getMedian(int a, int b, int c) {
-  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-  return c;
+// --- LOGICA MODULARE (Core 1) ---
+int readSensors() {
+  int rawLaser = INVALID_DIST;
+  VL53L0X_RangingMeasurementData_t m;
+  lox.rangingTest(&m, false);
+  if (m.RangeStatus != 4) rawLaser = m.RangeMilliMeter / 10;
+  if (rawLaser < MIN_VALID_DIST) rawLaser = INVALID_DIST;
+
+  laserHistory[laserIdx] = rawLaser;
+  laserIdx = (laserIdx + 1) % LASER_HISTORY_SIZE;
+  int laserVal = getMedian(laserHistory[0], laserHistory[1], laserHistory[2]);
+
+  unsigned int uS = sonar.ping_median(3);
+  int sonarVal = sonar.convert_cm(uS);
+  if (sonarVal > 0 && sonarVal < MIN_VALID_DIST) sonarVal = INVALID_DIST; 
+
+  if (laserVal > 0 && laserVal < LOCK_DIST) return laserVal;
+  if (sonarVal > 0 && sonarVal < MAX_WORLD_DIST) return sonarVal;
+  return INVALID_DIST;
 }
 
+void updateSystemState(int finalDist, unsigned long now) {
+  if (isTrackingMode && (now - lastDetectionTime > TRACKING_TIMEOUT_MS)) {
+    isTrackingMode = false;
+    trackBestDist = INVALID_DIST; trackBestAngle = trackingCenter;
+    myServo.setSpeed(SERVO_SPEED_SCAN);
+    detectionCount = 0; 
+  }
+
+  if (finalDist > 0 && finalDist < LOCK_DIST) {
+    detectionCount++;
+    if (isTrackingMode) lastDetectionTime = now;
+    
+    if (detectionCount >= TRACK_MIN_DETECTIONS) {
+      lastDetectionTime = now;
+      if (!isTrackingMode) {
+        isTrackingMode = true;
+        trackingCenter = myServo.getCurrentAngle();
+        trackBestAngle = trackingCenter;
+        trackBestDist  = finalDist;
+        trackSweepLeft = true;
+      }
+      if(detectionCount > TRACK_MAX_DETECTIONS) detectionCount = TRACK_MAX_DETECTIONS;
+    }
+  } else {
+    detectionCount = 0; 
+  }
+
+  if (finalDist > 0 && finalDist < DANGER_DIST && detectionCount >= DANGER_MIN_DETECTIONS) {
+    isDangerActive = true;
+    lastDangerTime = now;
+    lastKnownDangerDist = finalDist;
+  }
+  
+  if (isDangerActive && (now - lastDangerTime > DANGER_TIMEOUT_MS)) {
+    isDangerActive = false;
+  }
+}
+
+void updateServo(int finalDist, int currentServoAngle) {
+  if (isTrackingMode) {
+    int minCone = max(SERVO_MIN_ANGLE, trackingCenter - TRACK_WIDTH);
+    int maxCone = min(SERVO_MAX_ANGLE, trackingCenter + TRACK_WIDTH);
+
+    if (myServo.isMoving()) {
+      if (finalDist > 0 && finalDist < LOCK_DIST && finalDist < trackBestDist) {
+        trackBestDist = finalDist; trackBestAngle = currentServoAngle;
+      }
+    } else {
+      if (trackBestDist < LOCK_DIST) trackingCenter = trackBestAngle;
+      trackBestDist = INVALID_DIST; trackBestAngle = trackingCenter;
+      minCone = max(SERVO_MIN_ANGLE, trackingCenter - TRACK_WIDTH);
+      maxCone = min(SERVO_MAX_ANGLE, trackingCenter + TRACK_WIDTH);
+      trackSweepLeft = !trackSweepLeft;
+      int nextTarget = trackSweepLeft ? minCone : maxCone;
+      myServo.setSpeed(SERVO_SPEED_TRACK); myServo.startEaseTo(nextTarget);
+    }
+  } else {
+    if (!myServo.isMoving()) {
+      currentScanTarget = (currentScanTarget >= SERVO_MAX_ANGLE - 5) ? SERVO_MIN_ANGLE : SERVO_MAX_ANGLE;
+      myServo.setSpeed(SERVO_SPEED_SCAN); myServo.startEaseTo(currentScanTarget);
+    }
+  }
+}
+
+void updatePeripherals(int finalDist, int currentServoAngle, unsigned long now) {
+  if (finalDist > 0 && finalDist < MAX_WORLD_DIST) radarMap[currentServoAngle] = finalDist; 
+  else radarMap[currentServoAngle] = 0;
+
+  digitalWrite(PIN_LED_V, !isDangerActive && !isTrackingMode ? HIGH : LOW);
+  digitalWrite(PIN_LED_Y, isTrackingMode && !isDangerActive ? HIGH : LOW);
+  digitalWrite(PIN_LED_R, isDangerActive ? HIGH : LOW);
+  digitalWrite(PIN_BUZZ, isDangerActive ? HIGH : LOW);
+
+  if (now - lastDisplayUpdate > DISPLAY_UPDATE_MS) {
+    if (isDangerActive) drawDanger(lastKnownDangerDist);
+    else if (isTrackingMode) drawTracking(finalDist < LOCK_DIST ? finalDist : lastKnownDangerDist);
+    else drawScanning(currentServoAngle);
+    lastDisplayUpdate = now;
+  }
+}
+
+// --- SETUP & LOOP ---
 void setup() {
   Serial.begin(115200);
    
@@ -136,7 +263,7 @@ void setup() {
 
   if (myServo.attach(PIN_SERVO) != -1) {
     myServo.setEasingType(EASE_LINEAR);
-    myServo.setSpeed(30); myServo.startEaseTo(15);
+    myServo.setSpeed(SERVO_SPEED_SCAN); myServo.startEaseTo(SERVO_MIN_ANGLE);
   }
 
   xTaskCreatePinnedToCore(TaskTelegram, "TelegramTask", 10000, NULL, 1, NULL, 0);
@@ -146,184 +273,77 @@ void loop() {
   esp_task_wdt_reset();
 
   if (bootPhase < 3) {
-    display.clearDisplay();
-    display.setTextSize(1); display.setTextColor(SH110X_WHITE);
-    display.setCursor(10, 20); 
-    
-    if (bootPhase == 0) {
-      display.print("WIFI CONNECTING...");
-    } else if (bootPhase == 1) {
-      display.print("WIFI OK! ONLINE");
-    } else if (bootPhase == 2) {
-      display.print("WIFI FAIL. OFFLINE");
-    }
-    
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SH110X_WHITE); display.setCursor(10, 20); 
+    if (bootPhase == 0) display.print("WIFI CONNECTING...");
+    else if (bootPhase == 1) display.print("WIFI OK! ONLINE");
+    else if (bootPhase == 2) display.print("WIFI FAIL. OFFLINE");
     display.display();
     return;
   }
 
-
-  int currentServoAngle = myServo.getCurrentAngle();
   unsigned long now = millis();
-
-  int rawLaser = 999;
-  VL53L0X_RangingMeasurementData_t m;
-  lox.rangingTest(&m, false);
-  if (m.RangeStatus != 4) rawLaser = m.RangeMilliMeter / 10;
+  int currentServoAngle = myServo.getCurrentAngle();
   
-  if (rawLaser < 5) rawLaser = 999;
-
-  laserHistory[laserIdx] = rawLaser;
-  laserIdx = (laserIdx + 1) % 3;
-
-  int a = laserHistory[0], b = laserHistory[1], c = laserHistory[2];
-  int laserVal = getMedian(a, b, c);
-
-  unsigned int uS = sonar.ping_median(3);
-  int sonarVal = sonar.convert_cm(uS);
-  if (sonarVal > 0 && sonarVal < 5) {
-    sonarVal = 999; 
-  }
-
-  int finalDist = 999;
-  if (laserVal > 0 && laserVal < LOCK_DIST) finalDist = laserVal;
-  else if (sonarVal > 0 && sonarVal < MAX_WORLD_DIST) finalDist = sonarVal;
-
+  int finalDist = readSensors();
   sharedDist = finalDist;
   sharedAngle = currentServoAngle;
 
-  //Sgancio da tracking
-  if (isTrackingMode && (now - lastDetectionTime > 3000)) {
-    isTrackingMode = false;
-    trackBestDist = 999; trackBestAngle = trackingCenter;
-    myServo.setSpeed(30);
-    detectionCount = 0; 
-  }
+  updateSystemState(finalDist, now);
+  updateServo(finalDist, currentServoAngle);
+  updatePeripherals(finalDist, currentServoAngle, now);
 
-  //Aggancio tracking
-  if (finalDist > 0 && finalDist < LOCK_DIST) {
-    detectionCount++;
-    if (isTrackingMode) {
-      lastDetectionTime = now;
-    }
-    if (detectionCount >= 6) {
-      lastDetectionTime = now;
-      if (!isTrackingMode) {
-        isTrackingMode = true;
-        trackingCenter = currentServoAngle;
-        trackBestAngle = currentServoAngle;
-        trackBestDist  = finalDist;
-        trackSweepLeft = true;
-      }
-      if(detectionCount > 10) detectionCount = 10;
-    }
-  } else {
-    detectionCount = 0; 
-  }
-
-  //Passaggio a Danger
-  if (finalDist > 0 && finalDist < DANGER_DIST && detectionCount >= 3) {
-    isDangerActive = true;
-    lastDangerTime = now;
-    lastKnownDangerDist = finalDist;
-  }
-  //No Danger
-  if (isDangerActive && (now - lastDangerTime > 1000)) {
-    isDangerActive = false;
-  }
-
-  //Tracking vero e proprio
-  if (isTrackingMode) {
-    int minCone = max(15, trackingCenter - TRACK_WIDTH);
-    int maxCone = min(165, trackingCenter + TRACK_WIDTH);
-
-    //Mentre si muove aggiorna migliore distanza e angolo. Se è fermo (arrivato a min/max) aggiorna lo stato
-    //per ripartire a trackare e seguire il bersaglio
-    if (myServo.isMoving()) {
-      if (finalDist > 0 && finalDist < LOCK_DIST && finalDist < trackBestDist) {
-        trackBestDist = finalDist; trackBestAngle = currentServoAngle;
-      }
-    } else {
-      if (trackBestDist < LOCK_DIST) trackingCenter = trackBestAngle;
-      trackBestDist = 999; trackBestAngle = trackingCenter;
-      minCone = max(15, trackingCenter - TRACK_WIDTH);
-      maxCone = min(165, trackingCenter + TRACK_WIDTH);
-      trackSweepLeft = !trackSweepLeft;
-      int nextTarget = trackSweepLeft ? minCone : maxCone;
-      myServo.setSpeed(65); myServo.startEaseTo(nextTarget);
-    }
-  } else {
-    if (!myServo.isMoving()) {
-      currentScanTarget = (currentScanTarget >= 160) ? 15 : 165;
-      myServo.setSpeed(30); myServo.startEaseTo(currentScanTarget);
-    }
-  }
-
-  if (finalDist > 0 && finalDist < MAX_WORLD_DIST) radarMap[currentServoAngle] = finalDist; 
-  else radarMap[currentServoAngle] = 0;
-
-  digitalWrite(PIN_LED_V, LOW); digitalWrite(PIN_LED_Y, LOW); digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_BUZZ, LOW);
-
-  if (isDangerActive) {
-    digitalWrite(PIN_LED_R, HIGH);
-    digitalWrite(PIN_BUZZ, HIGH); 
-  } else if (isTrackingMode) {
-    digitalWrite(PIN_LED_Y, HIGH); 
-  } else {
-    digitalWrite(PIN_LED_V, HIGH); 
-  }
-
-  static unsigned long lastDisplayUpdate = 0;
-  if (now - lastDisplayUpdate > 50) {
-    if (isDangerActive) {
-      drawDanger(lastKnownDangerDist);
-    } else if (isTrackingMode) {
-      drawTracking(finalDist < LOCK_DIST ? finalDist : lastKnownDangerDist);
-    } else {
-      drawScanning(currentServoAngle);
-    }
-    lastDisplayUpdate = now;
-  }
   delay(10);
-
 }
 
+// --- FUNZIONI DI DISEGNO DISPLAY ---
 void drawScanning(int angle) {
   display.clearDisplay(); display.setTextSize(1); display.setCursor(0, 0); display.print("SCANNING");
-  display.drawCircle(64, 64, 60, SH110X_WHITE); display.drawCircle(64, 64, 30, SH110X_WHITE);
-  for (int i = 0; i < 181; i++) {
+  
+  display.drawCircle(SCAN_CENTER_X, SCAN_CENTER_Y, SCAN_RADIUS_OUTER, SH110X_WHITE); 
+  display.drawCircle(SCAN_CENTER_X, SCAN_CENTER_Y, SCAN_RADIUS_INNER, SH110X_WHITE);
+  
+  for (int i = 0; i < RADAR_MAP_SIZE; i++) {
     if (radarMap[i] > 0) {
       float rad = i * PI / 180.0;
-      int distPx = map(radarMap[i], 0, MAX_WORLD_DIST, 0, 60);
-      int px = 64 + distPx * cos(rad);
-      int py = 64 - distPx * sin(rad);
-      if (radarMap[i] < LOCK_DIST)
-        display.drawCircle(px, py, 1, SH110X_WHITE);
-      else
-      display.drawPixel(px, py, SH110X_WHITE);
+      int distPx = map(radarMap[i], 0, MAX_WORLD_DIST, 0, SCAN_RADIUS_OUTER);
+      int px = SCAN_CENTER_X + distPx * cos(rad);
+      int py = SCAN_CENTER_Y - distPx * sin(rad);
+      
+      if (radarMap[i] < LOCK_DIST) display.drawCircle(px, py, 1, SH110X_WHITE);
+      else display.drawPixel(px, py, SH110X_WHITE);
     }
-}
+  }
   float lineRad = (180 - angle) * PI / 180.0;
-  display.drawLine(64, 64, 64 + 60 * cos(lineRad), 64 - 60 * sin(lineRad), SH110X_WHITE);
+  display.drawLine(SCAN_CENTER_X, SCAN_CENTER_Y, SCAN_CENTER_X + SCAN_RADIUS_OUTER * cos(lineRad), SCAN_CENTER_Y - SCAN_RADIUS_OUTER * sin(lineRad), SH110X_WHITE);
   display.display();
 }
 
 void drawTracking(int d) {
-  display.clearDisplay(); display.drawRect(0, 0, 128, 64, SH110X_WHITE); //Cornice
-  display.drawLine(64, 10, 64, 54, SH110X_WHITE); display.drawLine(30, 32, 98, 32, SH110X_WHITE);
-  display.fillCircle(64, 32, 4, SH110X_WHITE);
+  display.clearDisplay(); 
+  display.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE); 
+  
+  // Mirino
+  display.drawLine(TRACK_CROSSHAIR_X, 10, TRACK_CROSSHAIR_X, OLED_HEIGHT - 10, SH110X_WHITE); 
+  display.drawLine(30, TRACK_CROSSHAIR_Y, 98, TRACK_CROSSHAIR_Y, SH110X_WHITE);
+  display.fillCircle(TRACK_CROSSHAIR_X, TRACK_CROSSHAIR_Y, TRACK_CROSSHAIR_R, SH110X_WHITE);
+  
+  // Testi
   display.setTextSize(1); display.setTextColor(SH110X_WHITE);
   display.setCursor(4, 4); display.print("TRACKING");
-  display.setCursor(4, 54); display.print("DST:"); display.print(d); display.print("cm");
-  if (isTrackingMode) { display.setCursor(90, 4); display.print("[LOCK]"); }
+  display.setCursor(4, OLED_HEIGHT - 10); display.print("DST:"); display.print(d); display.print("cm");
+  
+  if (isTrackingMode) { display.setCursor(OLED_WIDTH - 38, 4); display.print("[LOCK]"); }
   display.display();
 }
 
 void drawDanger(int d) {
-  display.clearDisplay(); display.fillRect(0, 0, 128, 64, SH110X_WHITE);
+  display.clearDisplay(); 
+  display.fillRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+  
   display.setTextColor(SH110X_BLACK);
-  display.setTextSize(2); display.setCursor(25, 15); display.print("DANGER");
-  display.setTextSize(2); display.setCursor(35, 40); display.print(d); display.print(" cm");
+  display.setTextSize(2); display.setCursor(OLED_WIDTH / 2 - 39, 15); display.print("DANGER");
+  display.setTextSize(2); display.setCursor(OLED_WIDTH / 2 - 29, 40); display.print(d); display.print(" cm");
+  
   display.setTextColor(SH110X_WHITE);
   display.display();
 }
